@@ -7,23 +7,60 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::{PhantomData, Unpin};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use actix::prelude::*;
 
 use diesel::associations::HasTable;
+use diesel::backend::Backend;
+use diesel::backend::SupportsReturningClause;
 use diesel::connection::Connection;
 use diesel::deserialize::Queryable;
 use diesel::insertable::CanInsertInSingleQuery;
+#[cfg(feature = "postgres")]
+use diesel::pg::Pg;
 use diesel::prelude::*;
 use diesel::query_builder::{AsQuery, QueryFragment, QueryId};
 use diesel::sql_types::HasSqlType;
+#[cfg(feature = "sqlite")]
+use diesel::sqlite::Sqlite;
 
 /// Error of cache actor
 pub type Error = diesel::result::Error;
 
 /// Result
 pub type Result<V> = std::result::Result<V, Error>;
+
+/// DefaultConnBackend
+pub trait DefaultConnBackend<T: diesel::Table + AsQuery>: Backend {}
+
+/// ReturningConnBackend
+pub trait ReturningConnBackend<T: AsQuery + diesel::Table>:
+    DefaultConnBackend<T> + SupportsReturningClause
+{
+}
+
+#[cfg(feature = "sqlite")]
+/// ConnBackend
+pub trait ConnBackend<T: diesel::Table + AsQuery>: DefaultConnBackend<T> {}
+
+#[cfg(feature = "postgres")]
+/// ConnBackend
+pub trait ConnBackend<T: diesel::Table>: ReturningConnBackend<T> {}
+
+#[cfg(feature = "sqlite")]
+impl<T: diesel::Table + AsQuery> DefaultConnBackend<T> for Sqlite {}
+#[cfg(feature = "postgres")]
+impl<T: diesel::Table + AsQuery> DefaultConnBackend<T> for Pg {}
+
+#[cfg(feature = "sqlite")]
+impl<T: diesel::Table + AsQuery> ConnBackend<T> for Sqlite {}
+
+#[cfg(feature = "postgres")]
+impl<T: diesel::Table + AsQuery> ReturningConnBackend<T> for Pg {}
+
+#[cfg(feature = "postgres")]
+impl<T: diesel::Table + AsQuery> ConnBackend<T> for Pg {}
 
 /// Trait for CacheDbActor. Requires at compile time for type to be queryable in
 /// table and database backend.
@@ -33,7 +70,7 @@ pub trait Cache<Conn, Table>:
     Queryable<Table::SqlType, Conn::Backend> + Sized + Debug + Clone + 'static
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
 {
@@ -54,6 +91,25 @@ where
         Ok(out)
     }
 
+    #[cfg(feature = "postgres")]
+    /// Write one entry to db returning affected row.
+    ///
+    /// Entry type should be insertable in table and its sqltype should be
+    /// insertable in one query.
+    fn write_one_with_result<W>(w: W, c: &Conn) -> Result<W>
+    where
+        Table::FromClause: QueryFragment<Conn::Backend>,
+        W: Insertable<Table>
+            + diesel::Queryable<<Table::AllColumns as diesel::Expression>::SqlType, Conn::Backend>,
+        W::Values: CanInsertInSingleQuery<Conn::Backend> + QueryFragment<Conn::Backend>,
+        Table::AllColumns: QueryFragment<Conn::Backend>,
+        Conn::Backend: ConnBackend<Table>
+            + SupportsReturningClause
+            + HasSqlType<<Table::AllColumns as diesel::Expression>::SqlType>,
+    {
+        diesel::insert_into(Table::table()).values(w).get_result(c)
+    }
+
     /// Write one entry to db.
     ///
     /// Entry type should be insertable in table and its sqltype should be
@@ -62,8 +118,7 @@ where
     where
         Table::FromClause: QueryFragment<Conn::Backend>,
         W: Insertable<Table>,
-        W::Values: CanInsertInSingleQuery<Conn::Backend>
-            + QueryFragment<Conn::Backend>,
+        W::Values: CanInsertInSingleQuery<Conn::Backend> + QueryFragment<Conn::Backend>,
     {
         diesel::insert_into(Table::table()).values(w).execute(c)
     }
@@ -74,7 +129,7 @@ where
 pub struct CacheDbActor<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table>,
@@ -82,7 +137,7 @@ where
     /// Connection for db
     conn: Conn,
     /// All items read from db
-    cache: Arc<HashMap<C::Id, C>>,
+    cache: Arc<RwLock<HashMap<C::Id, C>>>,
     /// Phantom marker for saving table inside structure
     t: PhantomData<Table>,
 }
@@ -95,12 +150,24 @@ impl<T: 'static> actix::Message for Save<T> {
     type Result = Result<()>;
 }
 
+#[cfg(feature = "postgres")]
+/// Save one entry
+#[derive(Debug)]
+pub struct SaveWithResult<W>(pub W);
+
+#[cfg(feature = "postgres")]
+impl<W: 'static> actix::Message for SaveWithResult<W>
+// where Table::AllColumns: 'static
+{
+    type Result = Result<W>;
+}
+
 /// Gets item by id
 #[derive(Debug)]
 pub struct Get<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table>,
@@ -112,7 +179,7 @@ where
 impl<Conn, Table, C> Clone for Get<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table>,
@@ -128,7 +195,7 @@ where
 impl<Conn, Table, C> Copy for Get<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table>,
@@ -139,7 +206,7 @@ where
 impl<Conn, Table, C> actix::Message for Get<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table>,
@@ -152,7 +219,7 @@ where
 pub struct GetAll<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table> + 'static,
@@ -163,7 +230,7 @@ where
 impl<Conn, Table, C> Default for GetAll<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table> + 'static,
@@ -178,18 +245,18 @@ where
 impl<Conn, Table, C> actix::Message for GetAll<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table> + 'static,
 {
-    type Result = Result<Arc<HashMap<C::Id, C>>>;
+    type Result = Result<Arc<RwLock<HashMap<C::Id, C>>>>;
 }
 
 impl<Conn, Table, C> CacheDbActor<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table>,
@@ -203,12 +270,18 @@ where
     }
 
     fn update(&mut self) -> Result<()> {
-        self.cache = Arc::new(C::read_all(&self.conn)?);
+        self.cache = Arc::new(RwLock::new(C::read_all(&self.conn)?));
         Ok(())
     }
 
+    fn update_one(&mut self, id: C::Id, v: C) -> Option<C> {
+        let mut cache_guard = self.cache.write().unwrap();
+        (*cache_guard).insert(id, v)
+    }
+
     fn get(&self, id: C::Id) -> Option<C> {
-        self.cache.get(&id).cloned()
+        let cache_guard = self.cache.read().unwrap();
+        (*cache_guard).get(&id).cloned()
     }
 
     fn timer_update(&mut self, context: &mut Context<Self>) {
@@ -221,7 +294,7 @@ where
 impl<Conn, Table, C> Actor for CacheDbActor<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table>,
@@ -233,22 +306,17 @@ where
     }
 }
 
-impl<Conn, Table, C> Handler<GetAll<Conn, Table, C>>
-    for CacheDbActor<Conn, Table, C>
+impl<Conn, Table, C> Handler<GetAll<Conn, Table, C>> for CacheDbActor<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table>,
 {
-    type Result = Result<Arc<HashMap<C::Id, C>>>;
+    type Result = Result<Arc<RwLock<HashMap<C::Id, C>>>>;
 
-    fn handle(
-        &mut self,
-        _: GetAll<Conn, Table, C>,
-        _: &mut Context<Self>,
-    ) -> Self::Result {
+    fn handle(&mut self, _: GetAll<Conn, Table, C>, _: &mut Context<Self>) -> Self::Result {
         // Flushing not by timer because we are not supposed to have error in
         // exported data.
         self.update()?;
@@ -256,17 +324,42 @@ where
     }
 }
 
+#[cfg(feature = "postgres")]
+impl<Conn, Table, C> Handler<SaveWithResult<C>> for CacheDbActor<Conn, Table, C>
+where
+    Conn: Connection + Unpin + 'static,
+    Conn::Backend: ConnBackend<Table>
+        + HasSqlType<Table::SqlType>
+        + HasSqlType<<Table::AllColumns as diesel::Expression>::SqlType>,
+    Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
+    Table::Query: QueryId + QueryFragment<Conn::Backend>,
+    Table::FromClause: QueryFragment<Conn::Backend>,
+    Table::AllColumns: QueryFragment<Conn::Backend>,
+    C: Cache<Conn, Table>,
+    C: Insertable<Table>
+        + diesel::Queryable<<Table::AllColumns as diesel::Expression>::SqlType, Conn::Backend>
+        + 'static,
+    C::Values: CanInsertInSingleQuery<Conn::Backend> + QueryFragment<Conn::Backend>,
+{
+    type Result = Result<C>;
+
+    fn handle(&mut self, pred: SaveWithResult<C>, _: &mut Context<Self>) -> Self::Result {
+        let row = C::write_one_with_result(pred.0, &self.conn)?;
+        self.update_one(C::get_id(&row), row.clone());
+        Ok(row)
+    }
+}
+
 impl<Conn, Table, C, W> Handler<Save<W>> for CacheDbActor<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     Table::FromClause: QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table>,
     W: Insertable<Table> + 'static,
-    W::Values:
-        CanInsertInSingleQuery<Conn::Backend> + QueryFragment<Conn::Backend>,
+    W::Values: CanInsertInSingleQuery<Conn::Backend> + QueryFragment<Conn::Backend>,
 {
     type Result = Result<()>;
 
@@ -277,22 +370,17 @@ where
     }
 }
 
-impl<Conn, Table, C> Handler<Get<Conn, Table, C>>
-    for CacheDbActor<Conn, Table, C>
+impl<Conn, Table, C> Handler<Get<Conn, Table, C>> for CacheDbActor<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
-    Conn::Backend: HasSqlType<Table::SqlType>,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
     Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     C: Cache<Conn, Table>,
 {
     type Result = Result<Option<C>>;
 
-    fn handle(
-        &mut self,
-        Get { id }: Get<Conn, Table, C>,
-        _: &mut Context<Self>,
-    ) -> Self::Result {
+    fn handle(&mut self, Get { id }: Get<Conn, Table, C>, _: &mut Context<Self>) -> Self::Result {
         match self.get(id.clone()) {
             Some(out) => Ok(Some(out)),
             None => {

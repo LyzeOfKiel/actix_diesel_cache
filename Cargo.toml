@@ -11,6 +11,10 @@ license = "MIT OR Apache-2.0"
 keywords = ["actix", "diesel", "actor", "cache", "database"]
 readme = "README.md"
 
+[features]
+postgres = []
+sqlite = []
+
 [dependencies]
 actix = "0.10"
-diesel = "1.4"
+diesel = { version="1.4" }
