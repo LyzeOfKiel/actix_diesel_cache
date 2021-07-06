@@ -138,6 +138,8 @@ where
     conn: Conn,
     /// All items read from db
     cache: Arc<RwLock<HashMap<C::Id, C>>>,
+    /// Cache valid
+    is_valid: bool,
     /// Phantom marker for saving table inside structure
     t: PhantomData<Table>,
 }
@@ -264,7 +266,7 @@ where
     /// Constructor
     pub fn new(conn: Conn) -> Result<Self> {
         let (cache, t) = Default::default();
-        let mut s = Self { conn, cache, t };
+        let mut s = Self { conn, cache, is_valid: true, t };
         s.update()?;
         Ok(s)
     }
@@ -317,9 +319,11 @@ where
     type Result = Result<Arc<RwLock<HashMap<C::Id, C>>>>;
 
     fn handle(&mut self, _: GetAll<Conn, Table, C>, _: &mut Context<Self>) -> Self::Result {
-        // Flushing not by timer because we are not supposed to have error in
-        // exported data.
-        self.update()?;
+        if !self.is_valid {
+            // Flushing not by timer because we are not supposed to have error in
+            // exported data.
+            self.update()?;
+        }
         Ok(Arc::clone(&self.cache))
     }
 }
@@ -364,6 +368,7 @@ where
     type Result = Result<()>;
 
     fn handle(&mut self, pred: Save<W>, _: &mut Context<Self>) -> Self::Result {
+        self.is_valid = false;
         C::write_one(pred.0, &self.conn)?;
         self.update()?;
         Ok(())
