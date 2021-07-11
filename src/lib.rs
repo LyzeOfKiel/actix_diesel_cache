@@ -96,12 +96,16 @@ where
     ///
     /// Entry type should be insertable in table and its sqltype should be
     /// insertable in one query.
-    fn write_one_with_result<W>(w: W, c: &Conn) -> Result<W>
+    fn write_one_with_result<C, W>(w: W, c: &Conn) -> Result<C>
     where
         Table::FromClause: QueryFragment<Conn::Backend>,
-        W: Insertable<Table>
-            + diesel::Queryable<<Table::AllColumns as diesel::Expression>::SqlType, Conn::Backend>,
+        W: Insertable<Table>,
         W::Values: CanInsertInSingleQuery<Conn::Backend> + QueryFragment<Conn::Backend>,
+        C: Cache<Conn, Table>
+            + diesel::Queryable<
+                <<Table as diesel::Table>::AllColumns as diesel::Expression>::SqlType,
+                <Conn as diesel::Connection>::Backend,
+            >,
         Table::AllColumns: QueryFragment<Conn::Backend>,
         Conn::Backend: ConnBackend<Table>
             + SupportsReturningClause
@@ -155,13 +159,101 @@ impl<T: 'static> actix::Message for Save<T> {
 #[cfg(feature = "postgres")]
 /// Save one entry
 #[derive(Debug)]
-pub struct SaveWithResult<W>(pub W);
+pub struct SaveWithResult<Conn, Table, W, C>
+where
+    Conn: Connection + Unpin + 'static,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
+    Table: diesel::Table + HasTable<Table = Table> + AsQuery,
+    Table::Query: QueryId + QueryFragment<Conn::Backend>,
+    C: Cache<Conn, Table>,
+{
+    /// Data to write
+    pub w: W,
+    _c: PhantomData<C::Row>,
+}
+
+impl<Conn, Table, W, C> SaveWithResult<Conn, Table, W, C>
+where
+    Conn: Connection + Unpin + 'static,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
+    Table: diesel::Table + HasTable<Table = Table> + AsQuery,
+    Table::Query: QueryId + QueryFragment<Conn::Backend>,
+    C: Cache<Conn, Table>,
+{
+    /// Constructor
+    pub fn new(w: W) -> Self {
+        Self { w, _c: PhantomData }
+    }
+}
 
 #[cfg(feature = "postgres")]
-impl<W: 'static> actix::Message for SaveWithResult<W>
-// where Table::AllColumns: 'static
+impl<Conn, Table, W, C: Cache<Conn, Table>> actix::Message for SaveWithResult<Conn, Table, W, C>
+where
+    Conn: Connection + Unpin + 'static,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
+    Table: diesel::Table + HasTable<Table = Table> + AsQuery,
+    Table::Query: QueryId + QueryFragment<Conn::Backend>,
+    C: Cache<Conn, Table>,
 {
-    type Result = Result<W>;
+    type Result = Result<C>;
+}
+
+impl<Conn, Table, C> CacheDbActor<Conn, Table, C>
+where
+    Conn: Connection + Unpin + 'static,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
+    Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
+    Table::Query: QueryId + QueryFragment<Conn::Backend>,
+    C: Cache<Conn, Table>,
+{
+    /// Constructor
+    pub fn new(conn: Conn) -> Result<Self> {
+        let (cache, t) = Default::default();
+        let mut s = Self {
+            conn,
+            cache,
+            is_valid: true,
+            t,
+        };
+        s.update()?;
+        Ok(s)
+    }
+
+    fn update(&mut self) -> Result<()> {
+        self.cache = Arc::new(RwLock::new(C::read_all(&self.conn)?));
+        Ok(())
+    }
+
+    fn update_one(&mut self, id: C::Id, v: C) -> Option<C> {
+        let mut cache_guard = self.cache.write().unwrap();
+        (*cache_guard).insert(id, v)
+    }
+
+    fn get(&self, id: C::Id) -> Option<C> {
+        let cache_guard = self.cache.read().unwrap();
+        (*cache_guard).get(&id).cloned()
+    }
+
+    fn timer_update(&mut self, context: &mut Context<Self>) {
+        let dur = std::time::Duration::from_secs(60);
+        let _ = self.update();
+        TimerFunc::new(dur, Self::timer_update).spawn(context);
+    }
+}
+
+impl<Conn, Table, C> Actor for CacheDbActor<Conn, Table, C>
+where
+    Conn: Connection + Unpin + 'static,
+    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
+    Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
+    Table::Query: QueryId + QueryFragment<Conn::Backend>,
+    C: Cache<Conn, Table>,
+{
+    type Context = Context<Self>;
+
+    fn started(&mut self, context: &mut Context<Self>) {
+        self.timer_update(context)
+    }
 }
 
 /// Gets item by id
@@ -255,59 +347,6 @@ where
     type Result = Result<Arc<RwLock<HashMap<C::Id, C>>>>;
 }
 
-impl<Conn, Table, C> CacheDbActor<Conn, Table, C>
-where
-    Conn: Connection + Unpin + 'static,
-    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
-    Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
-    Table::Query: QueryId + QueryFragment<Conn::Backend>,
-    C: Cache<Conn, Table>,
-{
-    /// Constructor
-    pub fn new(conn: Conn) -> Result<Self> {
-        let (cache, t) = Default::default();
-        let mut s = Self { conn, cache, is_valid: true, t };
-        s.update()?;
-        Ok(s)
-    }
-
-    fn update(&mut self) -> Result<()> {
-        self.cache = Arc::new(RwLock::new(C::read_all(&self.conn)?));
-        Ok(())
-    }
-
-    fn update_one(&mut self, id: C::Id, v: C) -> Option<C> {
-        let mut cache_guard = self.cache.write().unwrap();
-        (*cache_guard).insert(id, v)
-    }
-
-    fn get(&self, id: C::Id) -> Option<C> {
-        let cache_guard = self.cache.read().unwrap();
-        (*cache_guard).get(&id).cloned()
-    }
-
-    fn timer_update(&mut self, context: &mut Context<Self>) {
-        let dur = std::time::Duration::from_secs(60);
-        let _ = self.update();
-        TimerFunc::new(dur, Self::timer_update).spawn(context);
-    }
-}
-
-impl<Conn, Table, C> Actor for CacheDbActor<Conn, Table, C>
-where
-    Conn: Connection + Unpin + 'static,
-    Conn::Backend: ConnBackend<Table> + HasSqlType<Table::SqlType>,
-    Table: diesel::Table + HasTable<Table = Table> + AsQuery + Unpin + 'static,
-    Table::Query: QueryId + QueryFragment<Conn::Backend>,
-    C: Cache<Conn, Table>,
-{
-    type Context = Context<Self>;
-
-    fn started(&mut self, context: &mut Context<Self>) {
-        self.timer_update(context)
-    }
-}
-
 impl<Conn, Table, C> Handler<GetAll<Conn, Table, C>> for CacheDbActor<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
@@ -329,7 +368,7 @@ where
 }
 
 #[cfg(feature = "postgres")]
-impl<Conn, Table, C> Handler<SaveWithResult<C>> for CacheDbActor<Conn, Table, C>
+impl<Conn, Table, W, C> Handler<SaveWithResult<Conn, Table, W, C>> for CacheDbActor<Conn, Table, C>
 where
     Conn: Connection + Unpin + 'static,
     Conn::Backend: ConnBackend<Table>
@@ -339,16 +378,22 @@ where
     Table::Query: QueryId + QueryFragment<Conn::Backend>,
     Table::FromClause: QueryFragment<Conn::Backend>,
     Table::AllColumns: QueryFragment<Conn::Backend>,
-    C: Cache<Conn, Table>,
-    C: Insertable<Table>
-        + diesel::Queryable<<Table::AllColumns as diesel::Expression>::SqlType, Conn::Backend>
-        + 'static,
-    C::Values: CanInsertInSingleQuery<Conn::Backend> + QueryFragment<Conn::Backend>,
+    C: Cache<Conn, Table>
+        + diesel::Queryable<
+            <<Table as diesel::Table>::AllColumns as diesel::Expression>::SqlType,
+            <Conn as diesel::Connection>::Backend,
+        >,
+    W: Insertable<Table>,
+    W::Values: CanInsertInSingleQuery<Conn::Backend> + QueryFragment<Conn::Backend>,
 {
     type Result = Result<C>;
 
-    fn handle(&mut self, pred: SaveWithResult<C>, _: &mut Context<Self>) -> Self::Result {
-        let row = C::write_one_with_result(pred.0, &self.conn)?;
+    fn handle(
+        &mut self,
+        pred: SaveWithResult<Conn, Table, W, C>,
+        _: &mut Context<Self>,
+    ) -> Self::Result {
+        let row = C::write_one_with_result(pred.w, &self.conn)?;
         self.update_one(C::get_id(&row), row.clone());
         Ok(row)
     }
