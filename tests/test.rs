@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::RwLockReadGuard};
 
 use actix::{Actor, Addr};
-use actix_diesel_cache::{CacheDbActor, GetAll, Save, SaveWithResult};
+use actix_diesel_cache::{messages::*, CacheDbActor};
 use diesel::{table, PgConnection};
 #[macro_use]
 extern crate diesel;
@@ -117,6 +117,17 @@ async fn savewithresult_works() {
         .addr
         .send(SaveWithResult::new(shop1.clone()))
         .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(shop.name, shop1.name);
+    assert_eq!(shop.address, shop1.address);
+
+    let shop: Shop = wrap
+        .addr
+        .send(Get { id: 1 })
+        .await
+        .unwrap()
         .unwrap()
         .unwrap();
 
